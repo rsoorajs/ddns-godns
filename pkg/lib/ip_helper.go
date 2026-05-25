@@ -308,7 +308,12 @@ func (helper *IPHelper) getIPOnline() string {
 			continue
 		}
 
-		body, _ := io.ReadAll(response.Body)
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			log.Errorf("request:%v failed to read response body: %v", reqURL, err)
+			response.Body.Close()
+			continue
+		}
 		ipReg := regexp.MustCompile(utils.IPPattern)
 		onlineIP = ipReg.FindString(string(body))
 		if onlineIP == "" {
