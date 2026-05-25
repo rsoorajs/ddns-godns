@@ -31,6 +31,8 @@ type IPHelper struct {
 	mutex         sync.RWMutex
 	configuration *settings.Settings
 	idx           int64
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 var (
@@ -79,17 +81,35 @@ func GetIPHelperInstance(conf *settings.Settings) *IPHelper {
 		helperInstance = &IPHelper{
 			configuration: conf,
 			idx:           -1,
+			stopCh:        make(chan struct{}),
 		}
 
 		SafeGo(func() {
+			ticker := time.NewTicker(time.Second * time.Duration(conf.Interval))
+			defer ticker.Stop()
+
+			helperInstance.getCurrentIP()
 			for {
-				helperInstance.getCurrentIP()
-				time.Sleep(time.Second * time.Duration(conf.Interval))
+				select {
+				case <-helperInstance.stopCh:
+					return
+				case <-ticker.C:
+					helperInstance.getCurrentIP()
+				}
 			}
 		})
 	})
 
 	return helperInstance
+}
+
+// Stop signals the background IP-refresh goroutine to exit. Safe to call
+// multiple times. Intended for process shutdown — the helper is a singleton
+// and will not auto-restart after Stop.
+func (helper *IPHelper) Stop() {
+	helper.stopOnce.Do(func() {
+		close(helper.stopCh)
+	})
 }
 
 func (helper *IPHelper) GetCurrentIP() string {
@@ -287,7 +307,15 @@ func (helper *IPHelper) getIPOnline() string {
 
 	var onlineIP string
 
-	for {
+	// Cap attempts so a configuration with all-broken IP URLs doesn't spin
+	// forever. Once exhausted, return "" and let callers fall back to the
+	// interface-based path.
+	maxAttempts := len(helper.reqURLs) * 3
+	if maxAttempts < 3 {
+		maxAttempts = 3
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		reqURL := helper.getNext()
 		req, _ := http.NewRequest("GET", reqURL, nil)
 

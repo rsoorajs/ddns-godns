@@ -2,7 +2,9 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -28,6 +30,10 @@ type DNSManager struct {
 	server      *server.Server
 	configPath  string
 	defaultAddr string
+	// restartMu serializes Restart() — a single config save can fire multiple
+	// fsnotify events, and overlapping restarts leave the manager in a
+	// partially-initialized state.
+	restartMu sync.Mutex
 }
 
 var (
@@ -72,9 +78,14 @@ func (manager *DNSManager) startServer() {
 			SetConfigPath(manager.configPath).
 			Build()
 
+		srv := manager.server
 		go func() {
-			if err := manager.server.Start(); err != nil {
-				log.Fatalf("Failed to start the web server, error:%v", err)
+			// Don't log.Fatalf here — Stop() / Restart() shut the server down
+			// intentionally, and crashing the whole process from a background
+			// goroutine on every restart would be wrong. Filter out the
+			// expected shutdown signal and report anything else.
+			if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Errorf("Web server stopped with error: %v", err)
 			}
 		}()
 	} else {
@@ -83,14 +94,21 @@ func (manager *DNSManager) startServer() {
 }
 
 func (manager *DNSManager) startMonitor() {
-	// Start listening for events.
+	// Capture the current ctx and watcher in locals so this goroutine tracks
+	// the lifecycle it was started with. Restart() reassigns these fields on
+	// the manager — without local capture, an old monitor goroutine would
+	// silently start reading from the new watcher's channels and double up
+	// with the freshly-spawned monitor.
+	ctx := manager.ctx
+	watcher := manager.watcher
+
 	go func() {
 		for {
 			select {
-			case <-manager.ctx.Done():
+			case <-ctx.Done():
 				log.Debug("Shutting down the old file watcher and the internal HTTP server...")
 				return
-			case event, ok := <-manager.watcher.Events:
+			case event, ok := <-watcher.Events:
 				if !ok {
 					return
 				}
@@ -116,9 +134,12 @@ func (manager *DNSManager) startMonitor() {
 
 						manager.config = newConfig
 						manager.Restart()
+						// Restart() cancels ctx and closes watcher — exit so
+						// the freshly-spawned monitor owns the new lifecycle.
+						return
 					}
 				}
-			case err, ok := <-manager.watcher.Errors:
+			case err, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
@@ -128,7 +149,7 @@ func (manager *DNSManager) startMonitor() {
 	}()
 
 	// Add a path.
-	if err := manager.watcher.Add(manager.configPath); err != nil {
+	if err := watcher.Add(manager.configPath); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -229,6 +250,12 @@ func (manager *DNSManager) Stop() {
 }
 
 func (manager *DNSManager) Restart() {
+	// Serialize restarts — fsnotify can fire multiple Write events for a
+	// single editor save, and overlapping Stop()/initManager() calls leave
+	// the manager with mismatched ctx/watcher/handler fields.
+	manager.restartMu.Lock()
+	defer manager.restartMu.Unlock()
+
 	log.Info("Restarting DNS manager...")
 	manager.Stop()
 
