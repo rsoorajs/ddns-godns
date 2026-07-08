@@ -220,7 +220,7 @@ func (helper *IPHelper) getIPFromInterface() (string, error) {
 			continue
 		}
 
-		if ip.IsPrivate() {
+		if !helper.configuration.AllowPrivate && ip.IsPrivate() {
 			continue
 		}
 
